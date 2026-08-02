@@ -1,28 +1,43 @@
 import streamlit as st
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 st.set_page_config(page_title="Calcio Predictor", page_icon="⚽", layout="wide")
 
 st.title("⚽ Calcio Predictor")
-st.caption("Previsione risultati Serie A basata su machine learning e dati storici reali.")
+st.caption("Previsione risultati e gol basata su machine learning e dati storici reali, su 5 campionati europei.")
+
+LEGHE = {
+    "Serie A (Italia)": "I1",
+    "Premier League (Inghilterra)": "E0",
+    "La Liga (Spagna)": "SP1",
+    "Bundesliga (Germania)": "D1",
+    "Ligue 1 (Francia)": "F1"
+}
+
+lega_label = st.selectbox("Campionato", list(LEGHE.keys()))
+codice_lega = LEGHE[lega_label]
 
 @st.cache_data(ttl=3600)
-def carica_dati():
+def carica_dati(codice_lega):
     stagioni = ['1920', '2021', '2122', '2223', '2324']
     lista_df = []
     for s in stagioni:
-        url = f"https://www.football-data.co.uk/mmz4281/{s}/I1.csv"
-        temp = pd.read_csv(url)
-        lista_df.append(temp)
+        url = f"https://www.football-data.co.uk/mmz4281/{s}/{codice_lega}.csv"
+        try:
+            temp = pd.read_csv(url)
+            lista_df.append(temp)
+        except Exception:
+            continue
     df = pd.concat(lista_df, ignore_index=True)
-    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
+    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['Date', 'FTHG', 'FTAG', 'FTR'])
     df = df.sort_values('Date').reset_index(drop=True)
     return df
 
 @st.cache_resource(ttl=3600)
-def costruisci_modello_e_stato():
-    df = carica_dati()
+def costruisci_modello_e_stato(codice_lega):
+    df = carica_dati(codice_lega)
 
     storico_gol = {}
     storico_forma = {}
@@ -42,7 +57,6 @@ def costruisci_modello_e_stato():
             if squadra not in storico_forma:
                 storico_forma[squadra] = []
 
-        # Medie gol PRE-partita
         prec_h_fatti = storico_gol[home]['fatti'][-5:]
         prec_h_subiti = storico_gol[home]['subiti'][-5:]
         prec_a_fatti = storico_gol[away]['fatti'][-5:]
@@ -53,13 +67,11 @@ def costruisci_modello_e_stato():
         away_goals_avg.append(sum(prec_a_fatti)/len(prec_a_fatti) if prec_a_fatti else 1.3)
         away_conceded_avg.append(sum(prec_a_subiti)/len(prec_a_subiti) if prec_a_subiti else 1.3)
 
-        # Forma PRE-partita
         prec_h_forma = storico_forma[home][-5:]
         prec_a_forma = storico_forma[away][-5:]
         home_form.append(sum(prec_h_forma)/len(prec_h_forma) if prec_h_forma else 1.0)
         away_form.append(sum(prec_a_forma)/len(prec_a_forma) if prec_a_forma else 1.0)
 
-        # H2H PRE-partita
         chiave = tuple(sorted([home, away]))
         precedenti_h2h = storico_coppie.get(chiave, [])[-3:]
         if precedenti_h2h:
@@ -73,7 +85,6 @@ def costruisci_modello_e_stato():
         else:
             h2h_home_adv.append(1.0)
 
-        # Aggiorna storici DOPO aver calcolato le feature
         storico_gol[home]['fatti'].append(riga['FTHG'])
         storico_gol[home]['subiti'].append(riga['FTAG'])
         storico_gol[away]['fatti'].append(riga['FTAG'])
@@ -99,10 +110,17 @@ def costruisci_modello_e_stato():
     features = ['HomeGoalsAvg', 'HomeConcededAvg', 'AwayGoalsAvg', 'AwayConcededAvg',
                 'HomeFormPoints', 'AwayFormPoints', 'GoalDiffAdvantage', 'FormDiff', 'H2H_HomeAdvantage']
 
-    modello = RandomForestClassifier(n_estimators=300, random_state=42, max_depth=6, class_weight='balanced')
-    modello.fit(df[features], df['FTR'])
+    # Modello 1: chi vince (classificazione)
+    modello_risultato = RandomForestClassifier(n_estimators=300, random_state=42, max_depth=6, class_weight='balanced')
+    modello_risultato.fit(df[features], df['FTR'])
 
-    # Stato attuale di ogni squadra (per previsioni future)
+    # Modello 2 e 3: quanti gol segna ciascuna squadra (regressione, numero continuo)
+    modello_gol_casa = RandomForestRegressor(n_estimators=300, random_state=42, max_depth=6)
+    modello_gol_casa.fit(df[features], df['FTHG'])
+
+    modello_gol_trasferta = RandomForestRegressor(n_estimators=300, random_state=42, max_depth=6)
+    modello_gol_trasferta.fit(df[features], df['FTAG'])
+
     stato_squadre = {}
     for squadra in storico_gol:
         fatti = storico_gol[squadra]['fatti'][-5:]
@@ -114,16 +132,18 @@ def costruisci_modello_e_stato():
             'FormPoints': sum(forma)/len(forma) if forma else 1.0
         }
 
-    return modello, stato_squadre, storico_coppie, features, sorted(storico_gol.keys())
+    return modello_risultato, modello_gol_casa, modello_gol_trasferta, stato_squadre, storico_coppie, features, sorted(storico_gol.keys())
 
-modello, stato_squadre, storico_coppie, features, squadre_disponibili = costruisci_modello_e_stato()
+with st.spinner(f"Caricamento dati {lega_label}..."):
+    modello_risultato, modello_gol_casa, modello_gol_trasferta, stato_squadre, storico_coppie, features, squadre_disponibili = costruisci_modello_e_stato(codice_lega)
 
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
-    squadra_casa = st.selectbox("Squadra Casa", squadre_disponibili, index=squadre_disponibili.index("Inter") if "Inter" in squadre_disponibili else 0)
+    squadra_casa = st.selectbox("Squadra Casa", squadre_disponibili, index=0)
 with col2:
-    squadra_trasferta = st.selectbox("Squadra Trasferta", squadre_disponibili, index=squadre_disponibili.index("Milan") if "Milan" in squadre_disponibili else 1)
+    idx_away = 1 if len(squadre_disponibili) > 1 else 0
+    squadra_trasferta = st.selectbox("Squadra Trasferta", squadre_disponibili, index=idx_away)
 
 if st.button("🔮 Prevedi risultato", use_container_width=True, type="primary"):
     if squadra_casa == squadra_trasferta:
@@ -157,10 +177,12 @@ if st.button("🔮 Prevedi risultato", use_container_width=True, type="primary")
             'H2H_HomeAdvantage': h2h_val
         }])[features]
 
-        probabilita = modello.predict_proba(input_dati)[0]
-        classi = modello.classes_
-
+        probabilita = modello_risultato.predict_proba(input_dati)[0]
+        classi = modello_risultato.classes_
         prob_dict = dict(zip(classi, probabilita))
+
+        gol_previsti_casa = max(0, modello_gol_casa.predict(input_dati)[0])
+        gol_previsti_trasferta = max(0, modello_gol_trasferta.predict(input_dati)[0])
 
         st.divider()
         st.subheader(f"{squadra_casa} vs {squadra_trasferta}")
@@ -173,7 +195,19 @@ if st.button("🔮 Prevedi risultato", use_container_width=True, type="primary")
         with c3:
             st.metric(f"✈️ Vittoria {squadra_trasferta}", f"{prob_dict.get('A', 0):.0%}")
 
-        st.caption("Previsione basata su forma recente, media gol e scontri diretti storici. Nessun modello di ML predice il calcio con certezza — trattalo come un'indicazione statistica, non una garanzia.")
+        st.divider()
+        st.subheader("⚽ Previsione gol")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            st.metric(f"Gol previsti {squadra_casa}", f"{gol_previsti_casa:.1f}")
+        with g2:
+            st.metric(f"Gol previsti {squadra_trasferta}", f"{gol_previsti_trasferta:.1f}")
+
+        risultato_probabile = f"{round(gol_previsti_casa)}-{round(gol_previsti_trasferta)}"
+        st.info(f"Risultato più probabile secondo il modello: **{risultato_probabile}**")
+
+        st.caption("Previsione basata su forma recente, media gol e scontri diretti storici. I numeri di gol sono medie statistiche (es. 1.8 significa 'quasi 2 gol in media'), non predizioni esatte garantite.")
 
 st.divider()
 st.caption("Creato con scikit-learn e Streamlit • Dati storici da football-data.co.uk")
